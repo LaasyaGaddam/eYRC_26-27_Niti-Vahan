@@ -19,8 +19,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          6257
+# Author List:      Himasree , Ujwala , Laasya , Samiksha
 # Filename:         lane_detection.py
 # Functions:        detect_lane
 # Global variables: < List any global variables you add, "None" if you add none >
@@ -41,80 +41,392 @@ LANE_RIGHT = "right"
 LANE_UNKNOWN = "unknown"
 VALID_LANES = (LANE_LEFT, LANE_RIGHT, LANE_UNKNOWN)
 
+_prev_lane = "unknown"
+_prev_center_x = -1
+_prev_lane_width = 315.0
 
-##############################################################
-############### ADD YOUR IMPLEMENTATION HERE #################
-##############################################################
 
 def detect_lane(frame):
-    '''
-    Purpose:
-    ---
-    Detect the lane in a single frame and report where the centre of the lane
-    is, and which of the two lanes the vehicle is currently in.
+    global _prev_lane, _prev_center_x, _prev_lane_width
 
-    Input Arguments:
-    ---
-    `frame` :   [ numpy.ndarray ]
-        A single BGR frame read from the video, of shape (height, width, 3).
+    h, w = frame.shape[:2]
 
-    Returns:
-    ---
-    `result` :  [ dict ]
-        {
-            "center_x" : int,   x-pixel of the lane centre in this frame,
-                                or -1 if the lane could not be found
-            "lane"     : str,   "left", "right" or "unknown"
+    # COnvert to HSV 
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Road region
+    roi_top = int(0.35 * h)
+    roi = hsv[roi_top:h, :]
+
+    # White dashed centre line
+    white_mask = cv2.inRange(
+        roi,
+        np.array([0, 0, 140], dtype=np.uint8),
+        np.array([180, 115, 255], dtype=np.uint8)
+    )
+
+    # Yellow outer boundary
+    yellow_mask = cv2.inRange(
+        roi,
+        np.array([12, 55, 65], dtype=np.uint8),
+        np.array([45, 255, 255], dtype=np.uint8)
+    )
+
+    # Morphological cleanup
+    close_kernel = np.ones((5, 5), np.uint8)
+    open_kernel = np.ones((3, 3), np.uint8)
+
+    white_mask = cv2.morphologyEx(
+        white_mask,
+        cv2.MORPH_CLOSE,
+        close_kernel,
+        iterations=2
+    )
+
+    yellow_mask = cv2.morphologyEx(
+        yellow_mask,
+        cv2.MORPH_CLOSE,
+        close_kernel,
+        iterations=2
+    )
+
+    white_mask = cv2.morphologyEx(
+        white_mask,
+        cv2.MORPH_OPEN,
+        open_kernel,
+        iterations=1
+    )
+
+    yellow_mask = cv2.morphologyEx(
+        yellow_mask,
+        cv2.MORPH_OPEN,
+        open_kernel,
+        iterations=1
+    )
+
+    # Get pixel coordinates
+    wy, wx = np.where(white_mask > 0)
+    yy, yx = np.where(yellow_mask > 0)
+
+    wy = wy + roi_top
+    yy = yy + roi_top
+
+    # Remove extreme image-edge noise
+    margin = int(0.02 * w)
+
+    keep_w = (wx >= margin) & (wx < w - margin)
+    keep_y = (yx >= margin) & (yx < w - margin)
+
+    wx, wy = wx[keep_w], wy[keep_w]
+    yx, yy = yx[keep_y], yy[keep_y]
+
+    # Fit curves
+    white_fit = _fit_lane_curve(wx, wy)
+    yellow_fit = _fit_lane_curve(yx, yy)
+
+    # Several look-ahead positions
+    y_samples = np.array([
+        0.68 * h,
+        0.74 * h,
+        0.80 * h,
+        0.86 * h,
+        0.91 * h
+    ])
+
+    white_vals = None
+    yellow_vals = None
+
+    if white_fit is not None:
+        white_vals = np.polyval(
+            white_fit,
+            y_samples
+        )
+
+    if yellow_fit is not None:
+        yellow_vals = np.polyval(
+            yellow_fit,
+            y_samples
+        )
+
+    # ---------------------------------------------------------
+    # Estimate lane width from places where both markings exist
+    # ---------------------------------------------------------
+    widths = []
+
+    if white_vals is not None and yellow_vals is not None:
+
+        for white_x, yellow_x in zip(
+            white_vals,
+            yellow_vals
+        ):
+            width_here = yellow_x - white_x
+
+            if (
+                0 <= white_x < w and
+                0 <= yellow_x < w and
+                0.10 * w < width_here < 0.65 * w
+            ):
+                widths.append(width_here)
+
+    if len(widths) >= 2:
+
+        measured_width = float(
+            np.median(widths)
+        )
+
+        _prev_lane_width = (
+            0.80 * _prev_lane_width +
+            0.20 * measured_width
+        )
+
+    lane_width = _prev_lane_width
+    # Evaluate at look-ahead position
+    y_eval = 0.83 * h
+
+    white_x = None
+    yellow_x = None
+
+    if white_fit is not None:
+        white_x = float(
+            np.polyval(
+                white_fit,
+                y_eval
+            )
+        )
+
+    if yellow_fit is not None:
+        yellow_x = float(
+            np.polyval(
+                yellow_fit,
+                y_eval
+            )
+        )
+
+    white_valid = (
+        white_x is not None and
+        np.isfinite(white_x) and
+        0 <= white_x < w
+    )
+
+    yellow_valid = (
+        yellow_x is not None and
+        np.isfinite(yellow_x) and
+        0 <= yellow_x < w
+    )
+    # Determine lane
+    vehicle_x = w / 2.0
+
+    lane = "unknown"
+    center_x = -1
+
+    if white_valid:
+
+        # White line is to the right of vehicle
+        # => vehicle is in LEFT lane
+        if white_x > vehicle_x:
+
+            lane = "left"
+
+            center_x = (
+                white_x -
+                lane_width / 2.0
+            )
+
+        # White line is to the left of vehicle
+        # => vehicle is in RIGHT lane
+        elif white_x < vehicle_x:
+
+            lane = "right"
+
+            # Best case: both markings visible
+            if yellow_valid and yellow_x > white_x:
+
+                actual_width = yellow_x - white_x
+
+                if (
+                    0.10 * w <
+                    actual_width <
+                    0.65 * w
+                ):
+                    lane_width = (
+                        0.80 * lane_width +
+                        0.20 * actual_width
+                    )
+                    _prev_lane_width = lane_width
+
+                center_x = (
+                    white_x +
+                    yellow_x
+                ) / 2.0
+
+            # Yellow temporarily missing
+            else:
+
+                center_x = (
+                    white_x +
+                    lane_width / 2.0
+                )
+    # Dashed white line may disappear temporarily.
+    # Use previous valid result rather than immediately giving up.
+    # ---------------------------------------------------------
+    if lane == "unknown":
+
+        if (
+            _prev_lane != "unknown" and
+            _prev_center_x >= 0
+        ):
+            return {
+                "center_x": int(_prev_center_x),
+                "lane": _prev_lane
+            }
+
+        return {
+            "center_x": -1,
+            "lane": "unknown"
         }
 
-    Example call:
-    ---
-    result = detect_lane(frame)
+    # ---------------------------------------------------------
+    # Validate centre
+    # ---------------------------------------------------------
+    if not np.isfinite(center_x):
+        return {
+            "center_x": -1,
+            "lane": "unknown"
+        }
 
-    COORDINATE SYSTEM:
-    ---
-    `center_x` is an absolute pixel column in the frame AS RECEIVED - the
-    dataset's own resolution, 640x480. It is compared against a ground truth
-    measured in those pixels, so it only means anything in them.
+    # ---------------------------------------------------------
+    # Smooth only moderate frame-to-frame changes.
+    # This reduces isolated noisy detections while still allowing
+    # the centre to move through a genuine curve.
+    # ---------------------------------------------------------
+    if (
+        _prev_lane == lane and
+        _prev_center_x >= 0
+    ):
 
-    You may resize, crop or warp all you like inside this function, but scale
-    the answer back before returning it. A centre found in a 320x240 copy is
-    half the value it should be, and a centre read off a bird's-eye view is in
-    warped coordinates, not frame ones - map the point back through the inverse
-    of your transform. Do not re-encode or resize the clip files themselves.
+        difference = abs(
+            center_x -
+            _prev_center_x
+        )
 
-    NOTE:
-    ---
-    This function must ONLY compute and return the result.
-    Do not call cv2.imshow(), cv2.waitKey(), cv2.imwrite() or print() from
-    inside it. All visualisation and debugging output belongs outside this
-    function - see draw_overlay() and process_video() below.
-    '''
+        if difference < 0.15 * w:
 
-    center_x = -1
-    lane = LANE_UNKNOWN
+            center_x = (
+                0.65 * center_x +
+                0.35 * _prev_center_x
+            )
 
-    #################### ADD YOUR CODE HERE ####################
-    # 1. Isolate the lane markings in `frame`
-    # 2. Work out which two markings bracket the vehicle
-    # 3. Compute the x-pixel of the lane centre   ->  center_x
-    # 4. Decide which lane the vehicle is in      ->  lane
-    ############################################################
+        else:
 
-    return {"center_x": center_x, "lane": lane}
+            center_x = (
+                0.30 * center_x +
+                0.70 * _prev_center_x
+            )
+
+    center_x = int(
+        round(center_x)
+    )
+
+    # Final bounds check
+    if not (0 <= center_x < w):
+        return {
+            "center_x": -1,
+            "lane": "unknown"
+        }
+
+    # Save for next frame
+    _prev_lane = lane
+    _prev_center_x = center_x
+
+    return {
+        "center_x": center_x,
+        "lane": lane
+    }
 
 
-# ------------------------------------------------------------------
-# Add any helper functions and global variables you need below this
-# comment, and keep them ABOVE the "END OF YOUR IMPLEMENTATION" line.
-# They must be called from detect_lane() - the evaluation script only
-# ever calls that one function. List them in the file header too.
-# ------------------------------------------------------------------
+def _fit_lane_curve(x, y):
+    """
+    Robust quadratic lane fit:
 
+        x = a*y^2 + b*y + c
 
-##############################################################
-################ END OF YOUR IMPLEMENTATION ##################
-##############################################################
+    Outlier pixels are repeatedly rejected.
+    """
+
+    if len(x) < 15:
+        return None
+
+    x = np.asarray(
+        x,
+        dtype=np.float64
+    )
+
+    y = np.asarray(
+        y,
+        dtype=np.float64
+    )
+
+    valid = (
+        np.isfinite(x) &
+        np.isfinite(y)
+    )
+
+    x = x[valid]
+    y = y[valid]
+
+    if len(x) < 15:
+        return None
+
+    if np.ptp(y) < 30:
+        return None
+
+    try:
+        coeff = np.polyfit(
+            y,
+            x,
+            2
+        )
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+
+    # Robust iterative fitting
+    for _ in range(5):
+
+        predicted = np.polyval(
+            coeff,
+            y
+        )
+
+        residual = np.abs(
+            x - predicted
+        )
+
+        median_error = np.median(
+            residual
+        )
+
+        threshold = max(
+            7.0,
+            2.5 * median_error
+        )
+
+        inliers = residual <= threshold
+
+        if np.count_nonzero(inliers) < 10:
+            break
+
+        try:
+            new_coeff = np.polyfit(
+                y[inliers],
+                x[inliers],
+                2
+            )
+        except (np.linalg.LinAlgError, ValueError):
+            break
+
+        coeff = new_coeff
+
+    return coeff
 
 
 #################### DO NOT EDIT BELOW THIS LINE ####################
